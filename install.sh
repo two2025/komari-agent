@@ -303,7 +303,7 @@ else
     download_url="https://github.com/two2025/komari-agent/releases/${download_path}/${file_name}"
 fi
 
-log_config "  GitHub proxy: ${download_url}"
+log_config "  download url: ${download_url}"
 
 log_step "Creating installation directory: ${GREEN}$target_dir${NC}"
 mkdir -p "$target_dir"
