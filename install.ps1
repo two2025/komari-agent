@@ -26,11 +26,42 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
 }
 
-# Ensure running as Administrator
+# Quote a value the way the Windows C runtime command-line parser expects,
+# so arguments survive command-line re-quoting boundaries (Start-Process
+# -ArgumentList, powershell -File, cmd /c, ...) even when they contain
+# spaces such as C:\Users\John Doe\... (komari-monitor/komari#655).
+function ConvertTo-CommandLineArg {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $escaped = $Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+
+# Ensure running as Administrator. Instead of failing, re-launch this script
+# elevated and re-quote its own arguments: wrappers that elevate externally
+# (Start-Process and friends) regularly split arguments of paths containing
+# spaces, which breaks installs for user names with spaces (komari#655).
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
-    Log-Error "Please run this script as Administrator."
-    exit 1
+    if ([string]::IsNullOrEmpty($PSCommandPath)) {
+        Log-Error "Cannot elevate a script that was not run from a file. Save it as install.ps1 and run it again as Administrator."
+        exit 1
+    }
+    Log-Warning "Administrator privileges are required. Requesting elevation, please accept the UAC prompt..."
+    $hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $relaunchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-CommandLineArg $PSCommandPath))
+    foreach ($a in $args) {
+        $relaunchArgs += ConvertTo-CommandLineArg ([string]$a)
+    }
+    try {
+        $elevated = Start-Process -FilePath $hostExe -Verb RunAs -Wait -PassThru -ArgumentList ($relaunchArgs -join ' ')
+        exit $elevated.ExitCode
+    }
+    catch {
+        Log-Error "Elevation failed or was cancelled: $_"
+        Log-Error "Please run this script as Administrator."
+        exit 1
+    }
 }
 
 # Prepare GitHub proxy display
@@ -206,10 +237,65 @@ function Uninstall-Previous {
 }
 Uninstall-Previous
 
+function Get-LatestSnapshotVersion {
+    param([Parameter(Mandatory = $true)][string]$AssetName)
+
+    $ApiUrl = "https://api.github.com/repos/komari-monitor/komari-agent/releases?per_page=100"
+    $ApiUrls = @($ApiUrl)
+    if ($GitHubProxy -ne "") {
+        $ApiUrls = @("$GitHubProxy/$ApiUrl", $ApiUrl)
+    }
+
+    for ($i = 0; $i -lt $ApiUrls.Count; $i++) {
+        try {
+            Log-Info "Fetching snapshot releases from GitHub API..."
+            $releases = Invoke-RestMethod -Uri $ApiUrls[$i] -UseBasicParsing
+        }
+        catch {
+            $releases = $null
+        }
+
+        if ($releases) {
+            $latestSnapshot = $releases |
+            Where-Object {
+                $_.draft -eq $false -and
+                $_.prerelease -eq $true -and
+                $_.tag_name -like "Snapshot-*" -and
+                (@($_.assets.name) -contains $AssetName)
+            } |
+            Sort-Object -Property @{ Expression = { [datetime]$_.published_at }; Descending = $true }, @{ Expression = { $_.tag_name }; Descending = $true } |
+            Select-Object -First 1
+
+            if ($latestSnapshot) {
+                return $latestSnapshot.tag_name
+            }
+        }
+
+        if ($i -lt ($ApiUrls.Count - 1)) {
+            Log-Warning "Failed to resolve snapshot releases through GitHub proxy, retrying directly."
+        }
+    }
+
+    throw "No snapshot release contains asset $AssetName."
+}
+
 $versionToInstall = ""
 if ($InstallVersion -ne "") {
     Log-Info "Attempting to install specified version: $InstallVersion"
-    $versionToInstall = $InstallVersion
+    if ($InstallVersion -ieq "snapshot") {
+        Log-Info "Resolving the latest snapshot version..."
+        try {
+            $versionToInstall = Get-LatestSnapshotVersion -AssetName $BinaryName
+            Log-Success "Latest snapshot version fetched: $versionToInstall"
+        }
+        catch {
+            Log-Error "Failed to resolve the latest snapshot version: $_"
+            exit 1
+        }
+    }
+    else {
+        $versionToInstall = $InstallVersion
+    }
 }
 else {
     $ApiUrl = "https://api.github.com/repos/komari-monitor/komari-agent/releases/latest"
@@ -245,9 +331,10 @@ Log-Success "Downloaded and saved to $AgentPath"
 # Register and start service
 Log-Step "Configuring Windows service with nssm..."
 $argString = $KomariArgs -join ' '
-# Ensure InstallDir and AgentPath are quoted if they contain spaces
-$quotedAgentPath = "`"$AgentPath`""
-nssm install $ServiceName $quotedAgentPath $argString
+# The application path is passed WITHOUT literal quotes: PowerShell already
+# quotes native arguments containing spaces on the command line, while
+# embedded quotes made nssm store a broken Application path (komari-agent#118).
+nssm install $ServiceName $AgentPath $argString
 # Set display name and startup type using nssm
 nssm set $ServiceName DisplayName "Komari Agent Service"
 nssm set $ServiceName Start SERVICE_AUTO_START

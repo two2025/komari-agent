@@ -1,8 +1,7 @@
 package server
 
 import (
-	"encoding/json"
-	"fmt"
+	"bytes"
 	"io"
 	"log"
 	"net/http"
@@ -11,6 +10,8 @@ import (
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	monitoring "github.com/komari-monitor/komari-agent/monitoring/unit"
+	"github.com/komari-monitor/komari-agent/protocol/transport"
+	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 	"github.com/komari-monitor/komari-agent/update"
 
 	pkg_flags "github.com/komari-monitor/komari-agent/cmd/flags"
@@ -36,61 +37,58 @@ func UpdateBasicInfo() {
 	}
 }
 func uploadBasicInfo() error {
-	cpu := monitoring.Cpu()
+	cpu := monitoring.CpuStaticInfo()
 
 	osname := monitoring.OSName()
 	kernelVersion := monitoring.KernelVersion()
 	ipv4, ipv6, _ := monitoring.GetIPAddress()
 
 	data := map[string]interface{}{
-		"cpu_name":       cpu.CPUName,
-		"cpu_cores":      cpu.CPUCores,
-		"arch":           cpu.CPUArchitecture,
-		"os":             osname,
-		"kernel_version": kernelVersion,
-		"ipv4":           ipv4,
-		"ipv6":           ipv6,
-		"mem_total":      monitoring.Ram().Total,
-		"swap_total":     monitoring.Swap().Total,
-		"disk_total":     monitoring.Disk().Total,
-		"gpu_name":       monitoring.GpuName(),
-		"virtualization": monitoring.Virtualized(),
-		"version":        update.CurrentVersion,
+		"cpu_name":           cpu.CPUName,
+		"cpu_cores":          cpu.CPUCores,
+		"cpu_physical_cores": cpu.CPUPhysicalCores,
+		"arch":               cpu.CPUArchitecture,
+		"os":                 osname,
+		"kernel_version":     kernelVersion,
+		"ipv4":               ipv4,
+		"ipv6":               ipv6,
+		"mem_total":          monitoring.Ram().Total,
+		"swap_total":         monitoring.Swap().Total,
+		"disk_total":         monitoring.Disk().Total,
+		"gpu_name":           monitoring.GpuName(),
+		"virtualization":     monitoring.Virtualized(),
+		"version":            update.CurrentVersion,
 	}
 
-	// 尝试上传完整数据
-	err := tryUploadData(data)
-	if err != nil {
-		// 兼容 <= 1.0.2
-		delete(data, "kernel_version")
-		err = tryUploadData(data)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return tryUploadData(data)
 }
 
 func tryUploadData(data map[string]interface{}) error {
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/uploadBasicInfo?token=" + flags.Token
-	payload, err := json.Marshal(data)
-	if err != nil {
-		return err
+	return tryUploadDataWithProtocol(data)
+}
+
+func tryUploadDataWithProtocol(data map[string]interface{}) error {
+	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	payload := v2.BuildBasicInfoPayload(data)
+	body := payload
+	compressed := false
+	if !flags.DisableCompression {
+		if gz, err := transport.GzipBytes(payload); err == nil {
+			body = gz
+			compressed = true
+		}
 	}
 
-	req, err := http.NewRequest("POST", endpoint, strings.NewReader(string(payload)))
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	// 添加Cloudflare Access头部
-	if flags.CFAccessClientID != "" && flags.CFAccessClientSecret != "" {
-		req.Header.Set("CF-Access-Client-Id", flags.CFAccessClientID)
-		req.Header.Set("CF-Access-Client-Secret", flags.CFAccessClientSecret)
+	if compressed {
+		req.Header.Set("Content-Encoding", "gzip")
 	}
 
-	client := dnsresolver.GetHTTPClient(30 * time.Second)
+	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -98,14 +96,19 @@ func tryUploadData(data map[string]interface{}) error {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	message := string(body)
+	message := string(respBody)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status code: %d,%s", resp.StatusCode, message)
+		return &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: message}
+	}
+	if len(bytes.TrimSpace(respBody)) > 0 {
+		if _, err := parseV2Response(respBody); err != nil {
+			return err
+		}
 	}
 
 	return nil

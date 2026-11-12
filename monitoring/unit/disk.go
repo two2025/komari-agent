@@ -83,26 +83,21 @@ func isPhysicalDisk(part disk.PartitionStat) bool {
 	}
 	mountpoint := strings.ToLower(part.Mountpoint)
 	// 排除挂载点
-	var mountpointsToExclude = []string{
+	var mountpointsToExcludePerfix = []string{
 		"/tmp",
 		"/var/tmp",
-		"/dev/shm",
+		"/dev",
 		"/run",
-		"/run/lock",
-		"/run/user",
 		"/var/lib/containers",
 		"/var/lib/docker",
 		"/proc",
-		"/dev/pts",
 		"/sys",
 		"/sys/fs/cgroup",
-		"/dev/mqueue",
 		"/etc/resolv.conf",
 		"/etc/host", // /etc/hosts,/etc/hostname
-		"/dev/hugepages",
 		"/nix/store",
 	}
-	for _, mp := range mountpointsToExclude {
+	for _, mp := range mountpointsToExcludePerfix {
 		if mountpoint == mp || strings.HasPrefix(mountpoint, mp) {
 			return false
 		}
@@ -120,9 +115,17 @@ func isPhysicalDisk(part disk.PartitionStat) bool {
 	if fstype == "fuseblk" {
 		return true
 	}
+
+	// Android 的 /sdcard 通过 FUSE (/dev/fuse) 挂载真实存储，不是网络文件系统。
+	// 限定挂载点，避免将其他 FUSE 文件系统计入磁盘统计。
+	if part.Device == "/dev/fuse" && fstype == "fuse" && mountpoint == "/sdcard" {
+		return true
+	}
+
 	var fstypeToExclude = []string{
 		"tmpfs",
 		"devtmpfs",
+		"udev",
 		"nfs",
 		"cifs",
 		"smb",
@@ -136,6 +139,10 @@ func isPhysicalDisk(part disk.PartitionStat) bool {
 		"cgroup",
 		"mqueue",
 		"hugetlbfs",
+		"debugfs",
+		"binfmt_misc",
+		"securityfs",
+		"nullfs",
 	}
 	for _, fs := range fstypeToExclude {
 		if fstype == fs || strings.HasPrefix(fstype, fs) {
@@ -172,10 +179,32 @@ func DiskList() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// 同一物理设备只保留路径最短的根挂载点
+		deviceMap := make(map[string]disk.PartitionStat)
 		for _, part := range usage {
 			if isPhysicalDisk(part) {
-				diskList = append(diskList, fmt.Sprintf("%s (%s)", part.Mountpoint, part.Fstype))
+				deviceID := part.Device
+				// ZFS去重: 基于 pool 名称
+				if strings.ToLower(part.Fstype) == "zfs" {
+					if idx := strings.Index(deviceID, "/"); idx != -1 {
+						deviceID = deviceID[:idx]
+					}
+				}
+
+				if existing, ok := deviceMap[deviceID]; ok {
+					// 优先保留路径更短的挂载点 (e.g., /volume1 优于 /volume1/@appdata/...)
+					if len(part.Mountpoint) < len(existing.Mountpoint) {
+						deviceMap[deviceID] = part
+					}
+				} else {
+					deviceMap[deviceID] = part
+				}
 			}
+		}
+
+		for _, part := range deviceMap {
+			diskList = append(diskList, fmt.Sprintf("%s (%s)", part.Mountpoint, part.Fstype))
 		}
 	}
 	return diskList, nil

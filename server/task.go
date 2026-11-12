@@ -2,17 +2,22 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/komari-monitor/komari-agent/dnsresolver"
+	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 	"github.com/komari-monitor/komari-agent/ws"
 	ping "github.com/prometheus-community/pro-bing"
 )
@@ -21,7 +26,7 @@ func NewTask(task_id, command string) {
 	if task_id == "" {
 		return
 	}
-	if command == "" {
+	if strings.TrimSpace(command) == "" {
 		uploadTaskResult(task_id, "No command provided", 0, time.Now())
 		return
 	}
@@ -30,72 +35,95 @@ func NewTask(task_id, command string) {
 		return
 	}
 	log.Printf("Executing task %s with command: %s", task_id, command)
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "+command)
-	} else {
-		cmd = exec.Command("sh", "-c", command)
+	result, exitCode := runTaskCommand(command)
+	uploadTaskResult(task_id, result, exitCode, time.Now())
+}
+
+func runTaskCommand(command string) (string, int) {
+	cmd, cleanup, err := buildTaskCommand(command)
+	if err != nil {
+		return err.Error(), -1
 	}
+	defer cleanup()
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
-	finishedAt := time.Now()
+	err = cmd.Run()
 
 	result := stdout.String()
 	if stderr.Len() > 0 {
-		result += "\n" + stderr.String()
+		result = appendErrorResult(result, stderr.String())
 	}
 	result = strings.ReplaceAll(result, "\r\n", "\n")
 	exitCode := 0
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
 			exitCode = exitError.ExitCode()
+		} else {
+			result = appendErrorResult(result, err.Error())
+			exitCode = -1
 		}
 	}
 
-	uploadTaskResult(task_id, result, exitCode, finishedAt)
+	return result, exitCode
+}
+
+func buildTaskCommand(command string) (*exec.Cmd, func(), error) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		scriptFile, err := os.CreateTemp("", "komari-task-*.ps1")
+		if err != nil {
+			return nil, func() {}, err
+		}
+		cleanup := func() {
+			_ = os.Remove(scriptFile.Name())
+		}
+		if _, err := scriptFile.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+			_ = scriptFile.Close()
+			cleanup()
+			return nil, func() {}, err
+		}
+		script := "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + command
+		if _, err := scriptFile.WriteString(script); err != nil {
+			_ = scriptFile.Close()
+			cleanup()
+			return nil, func() {}, err
+		}
+		if err := scriptFile.Close(); err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		cmd = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptFile.Name())
+		return cmd, cleanup, nil
+	} else {
+		cmd = exec.Command("sh", "-s")
+		cmd.Stdin = strings.NewReader(command)
+	}
+	return cmd, func() {}, nil
+}
+
+func appendErrorResult(result, err string) string {
+	if result == "" {
+		return err
+	}
+	return result + "\n" + err
 }
 
 func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time) {
-	payload := map[string]interface{}{
-		"task_id":     taskID,
-		"result":      result,
-		"exit_code":   exitCode,
-		"finished_at": finishedAt,
+	payload := v2.Request{
+		JSONRPC: v2.Version,
+		Method:  v2.MethodAgentTaskResult,
+		Params: v2.TaskResultParams{
+			TaskID:     taskID,
+			Result:     result,
+			ExitCode:   exitCode,
+			FinishedAt: finishedAt,
+		},
 	}
-
-	jsonData, _ := json.Marshal(payload)
-	endpoint := flags.Endpoint + "/api/clients/task/result?token=" + flags.Token
-
-	// 创建HTTP请求以支持自定义头部
-	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Printf("Failed to create task result request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// 添加Cloudflare Access头部（如果配置了）
-	if flags.CFAccessClientID != "" && flags.CFAccessClientSecret != "" {
-		req.Header.Set("CF-Access-Client-Id", flags.CFAccessClientID)
-		req.Header.Set("CF-Access-Client-Secret", flags.CFAccessClientSecret)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	maxRetry := flags.MaxRetries
-	for i := 0; i < maxRetry && (err != nil || resp.StatusCode != http.StatusOK); i++ {
-		log.Printf("Failed to upload task result, retrying %d/%d", i+1, maxRetry)
-		time.Sleep(2 * time.Second) // Wait before retrying
-		resp, err = client.Do(req)
-	}
-	if resp != nil {
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Failed to upload task result: %s", resp.Status)
-		}
+	if err := postV2RPC(payload); err != nil {
+		log.Printf("Failed to upload task result: %v", err)
 	}
 }
 
@@ -154,6 +182,9 @@ func tcpPing(target string, timeout time.Duration) (int64, error) {
 		port = "80"
 	}
 
+	// If the host is an IPv6 literal, it might be wrapped in brackets.
+	host = strings.Trim(host, "[]")
+
 	ip, err := resolveIP(host)
 	if err != nil {
 		return -1, err
@@ -182,22 +213,26 @@ func httpPing(target string, timeout time.Duration) (int64, error) {
 		target = "http://" + target
 	}
 
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// 在 Dial 之前解析 IP，排除 DNS 时间
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-				ip, err := resolveIP(host)
-				if err != nil {
-					return nil, err
-				}
-				return net.DialTimeout(network, net.JoinHostPort(ip, port), timeout)
-			},
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// 在 Dial 之前解析 IP，排除 DNS 时间
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ip, err := resolveIP(host)
+			if err != nil {
+				return nil, err
+			}
+			return net.DialTimeout(network, net.JoinHostPort(ip, port), timeout)
 		},
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
 	}
 	start := time.Now()
 	resp, err := client.Get(target)
@@ -220,8 +255,10 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 	var err error = nil
 	var latency int64
 	pingResult := -1
-	timeout := 3 * time.Second        // 默认超时时间
-	const highLatencyThreshold = 1000 // ms 阈值
+	timeout := 3 * time.Second           // 默认超时时间
+	const highLatencyThreshold = 1000    // ms 阈值
+	const retryDropThresholdTcping = 800 // ms 重试中延迟降低超过此值则基本认为发生重传
+	// 800ms = SYN/SYN-ACK 首次超时重传 1000ms - 防误判容许 200ms 延迟抖动
 
 	measure := func() (int64, error) {
 		switch pingType {
@@ -238,11 +275,16 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 	PingHighLatencyRetries := 3
 	// 首次测量
 	if latency, err = measure(); err == nil {
+		firstLatency := latency
 		if latency > int64(highLatencyThreshold) && PingHighLatencyRetries > 0 {
 			attempts := PingHighLatencyRetries
 			for i := 0; i < attempts; i++ {
 				if second, err2 := measure(); err2 == nil {
 					if second <= int64(highLatencyThreshold) {
+						if pingType == "tcp" && firstLatency-second > int64(retryDropThresholdTcping) {
+							err = errors.New("suspicious retransmission detected in tcp handshake")
+							break
+						}
 						latency = second
 						break
 					}
@@ -263,20 +305,76 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 	} else {
 		pingResult = int(latency)
 	}
-	payload := map[string]interface{}{
-		"type":        "ping_result",
-		"task_id":     taskID,
-		"ping_type":   pingType,
-		"value":       pingResult,
-		"finished_at": time.Now(),
-	}
+	finishedAt := time.Now()
+	wsPayload := v2.BuildPingResultPayload(taskID, pingType, pingResult, finishedAt)
 	// https://github.com/komari-monitor/komari/commit/eb87a4fc330b7d1c407fa4ff70177615a4f50a1f
 	// -1 代表丢包，服务端计算
 	//if pingResult == -1 {
 	//	return
 	//}
-	if err := conn.WriteJSON(payload); err != nil {
+	if conn == nil {
+		if err := postV2RPC(wsPayload); err != nil {
+			log.Printf("Failed to upload ping result over POST: %v", err)
+		}
+		return
+	}
+	if err := conn.WriteJSON(wsPayload); err != nil {
 		log.Printf("Failed to write JSON to WebSocket: %v", err)
 	}
 
+}
+
+func postV2RPC(payload interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	compressed := false
+	if !flags.DisableCompression {
+		if gz, err := gzipBytes(body); err == nil {
+			body = gz
+			compressed = true
+		}
+	}
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if compressed {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(respBody)}
+	}
+	if len(bytes.TrimSpace(respBody)) > 0 {
+		if _, err := parseV2Response(respBody); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func gzipBytes(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
